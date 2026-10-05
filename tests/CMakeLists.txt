@@ -8,7 +8,7 @@ if (NOT Catch2_FOUND)
   FetchContent_Declare(
     Catch2
     GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG        v2.13.4)
+    GIT_TAG        v3.5.3)
 
   FetchContent_MakeAvailable(Catch2)
 
@@ -30,12 +30,14 @@ add_executable(
     codec_multipart.cpp
     monitor.cpp
     utilities.cpp
+    timers.cpp
+    curve.cpp
 )
 
 target_include_directories(unit_tests PUBLIC ${CATCH_MODULE_PATH})
 target_link_libraries(
     unit_tests
-    PRIVATE Catch2::Catch2
+    PRIVATE Catch2::Catch2WithMain
     PRIVATE cppzmq
     PRIVATE ${CMAKE_THREAD_LIBS_INIT}
 )
@@ -44,7 +46,8 @@ OPTION (COVERAGE "Enable gcda file generation needed by lcov" OFF)
 
 if (COVERAGE)
     target_compile_options(unit_tests PRIVATE --coverage)
-    target_link_libraries(unit_tests PRIVATE --coverage)
+    target_link_options(unit_tests PRIVATE --coverage)
+    message(STATUS "Coverage enabled")
 endif()
 
 include(CTest)

@@ -1,14 +1,181 @@
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <zmq_addon.hpp>
+#include "testutil.hpp"
+
+#include <utility>
 
 #ifdef ZMQ_HAS_RVALUE_REFS
 
+TEST_CASE("multipart send handles empty messages", "[multipart]")
+{
+    zmq::context_t context;
+    zmq::socket_t output(context, zmq::socket_type::push);
+    zmq::multipart_t message;
+    REQUIRE(message.send(output, ZMQ_DONTWAIT | ZMQ_SNDMORE));
+    REQUIRE(
+      message.send(output, zmq::send_flags::dontwait | zmq::send_flags::sndmore));
+    CHECK(message.empty());
+}
+
+TEST_CASE("multipart send ignores caller SNDMORE", "[multipart]")
+{
+    const int part_count = GENERATE(1, 3);
+    zmq::context_t context;
+    zmq::socket_t output(context, zmq::socket_type::push);
+    zmq::socket_t input(context, zmq::socket_type::pull);
+    output.set(zmq::sockopt::linger, 0);
+    output.set(zmq::sockopt::sndtimeo, 1000);
+    input.set(zmq::sockopt::rcvtimeo, 1000);
+    output.bind("inproc://multipart.send.sndmore");
+    input.connect("inproc://multipart.send.sndmore");
+    zmq::multipart_t message;
+    message.addstr("");
+    if (part_count > 1) {
+        message.addstr("middle");
+        message.addstr("last");
+    }
+    const zmq::multipart_t expected = message.clone();
+
+    SECTION("integer flags")
+    {
+        REQUIRE(message.send(output, ZMQ_SNDMORE));
+    }
+    SECTION("send_flags overload")
+    {
+        REQUIRE(message.send(output, zmq::send_flags::sndmore));
+    }
+
+    CHECK(message.empty());
+    zmq::multipart_t received;
+    REQUIRE(received.recv(input));
+    CHECK(received == expected);
+}
+
+TEST_CASE("multipart send retains parts on EAGAIN", "[multipart]")
+{
+    const int part_count = GENERATE(1, 3);
+    const std::string first = GENERATE(std::string(), std::string("first"));
+    zmq::context_t context;
+    zmq::socket_t output(context, zmq::socket_type::push);
+    output.set(zmq::sockopt::linger, 0);
+    output.bind("inproc://multipart.send.retry");
+    zmq::multipart_t message;
+    message.addstr(first);
+    if (part_count > 1) {
+        message.addstr(std::string(256, '\0'));
+        message.addstr("last");
+    }
+    const zmq::multipart_t expected = message.clone();
+
+    SECTION("nonblocking integer flags")
+    {
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            REQUIRE_FALSE(message.send(output, ZMQ_DONTWAIT));
+            REQUIRE(message == expected);
+        }
+    }
+    SECTION("timed send_flags overload")
+    {
+        output.set(zmq::sockopt::sndtimeo, 1);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            REQUIRE_FALSE(message.send(output, zmq::send_flags::none));
+            REQUIRE(message == expected);
+        }
+    }
+
+    zmq::socket_t input(context, zmq::socket_type::pull);
+    input.set(zmq::sockopt::rcvtimeo, 1000);
+    input.connect("inproc://multipart.send.retry");
+    output.set(zmq::sockopt::sndtimeo, 1000);
+    REQUIRE(message.send(output));
+    CHECK(message.empty());
+    zmq::multipart_t received;
+    REQUIRE(received.recv(input));
+    CHECK(received == expected);
+}
+
+TEST_CASE("multipart send retains parts at high water mark", "[multipart]")
+{
+    zmq::context_t context;
+    zmq::socket_t output(context, zmq::socket_type::push);
+    zmq::socket_t input(context, zmq::socket_type::pull);
+    output.set(zmq::sockopt::linger, 0);
+    output.set(zmq::sockopt::sndhwm, 1);
+    output.set(zmq::sockopt::sndtimeo, 1000);
+    input.set(zmq::sockopt::rcvhwm, 1);
+    input.set(zmq::sockopt::rcvtimeo, 1000);
+    output.bind("inproc://multipart.send.hwm");
+    input.connect("inproc://multipart.send.hwm");
+
+    int queued = 0;
+    while (queued < 16
+           && output.send(zmq::str_buffer("queued"), zmq::send_flags::dontwait))
+        ++queued;
+    REQUIRE(queued > 0);
+    REQUIRE(queued < 16);
+
+    zmq::multipart_t message;
+    message.addstr("first");
+    message.addstr("last");
+    const zmq::multipart_t expected = message.clone();
+    REQUIRE_FALSE(message.send(output, zmq::send_flags::dontwait));
+    REQUIRE(message == expected);
+
+    for (int i = 0; i < queued; ++i) {
+        zmq::message_t part;
+        REQUIRE(input.recv(part));
+        CHECK(part.to_string() == "queued");
+    }
+    REQUIRE(message.send(output));
+    CHECK(message.empty());
+    zmq::multipart_t received;
+    REQUIRE(received.recv(input));
+    CHECK(received == expected);
+}
+
+TEST_CASE("multipart send retains parts on exception", "[multipart]")
+{
+    zmq::context_t context;
+    zmq::socket_t output(context, zmq::socket_type::rep);
+    zmq::socket_t input(context, zmq::socket_type::req);
+    output.set(zmq::sockopt::linger, 0);
+    output.set(zmq::sockopt::sndtimeo, 1000);
+    output.set(zmq::sockopt::rcvtimeo, 1000);
+    input.set(zmq::sockopt::linger, 0);
+    input.set(zmq::sockopt::sndtimeo, 1000);
+    input.set(zmq::sockopt::rcvtimeo, 1000);
+    output.bind("inproc://multipart.send.exception");
+    input.connect("inproc://multipart.send.exception");
+    zmq::multipart_t message;
+    message.addstr("first");
+    message.addstr("last");
+    const zmq::multipart_t expected = message.clone();
+    CHECK_THROWS_ZMQ_ERROR(EFSM, message.send(output));
+    REQUIRE(message == expected);
+
+    REQUIRE(input.send(zmq::str_buffer("request")));
+    zmq::message_t request;
+    REQUIRE(output.recv(request));
+    REQUIRE(message.send(output));
+    CHECK(message.empty());
+    zmq::multipart_t received;
+    REQUIRE(received.recv(input));
+    CHECK(received == expected);
+}
+
 #ifdef ZMQ_CPP17
-static_assert(std::is_invocable<decltype(&zmq::multipart_t::send),
+using multipart_send_int_t = bool (zmq::multipart_t::*)(zmq::socket_ref, int);
+using multipart_send_flags_t = bool (zmq::multipart_t::*)(zmq::socket_ref,
+                                                          zmq::send_flags);
+static_assert(
+  std::is_invocable<multipart_send_int_t, zmq::multipart_t *, zmq::socket_ref, int>::
+    value,
+  "Can't multipart_t::send with socket_ref");
+static_assert(std::is_invocable<multipart_send_flags_t,
                                 zmq::multipart_t *,
                                 zmq::socket_ref,
-                                int>::value,
-              "Can't multipart_t::send with socket_ref");
+                                zmq::send_flags>::value,
+              "Can't multipart_t::send with send_flags");
 static_assert(std::is_invocable<decltype(&zmq::multipart_t::recv),
                                 zmq::multipart_t *,
                                 zmq::socket_ref,
@@ -17,6 +184,19 @@ static_assert(std::is_invocable<decltype(&zmq::multipart_t::recv),
 #endif
 static_assert(std::is_constructible<zmq::multipart_t, zmq::socket_ref>::value,
               "Can't construct with socket_ref");
+static_assert(std::is_same<decltype(std::declval<zmq::multipart_t &>().front()),
+                           const zmq::message_t &>::value,
+              "multipart_t::front() should keep returning const message_t&");
+static_assert(
+  std::is_same<decltype(std::declval<const zmq::multipart_t &>().front()),
+               const zmq::message_t &>::value,
+  "multipart_t::front() const should return const message_t&");
+static_assert(std::is_same<decltype(std::declval<zmq::multipart_t &>().back()),
+                           const zmq::message_t &>::value,
+              "multipart_t::back() should keep returning const message_t&");
+static_assert(std::is_same<decltype(std::declval<const zmq::multipart_t &>().back()),
+                           const zmq::message_t &>::value,
+              "multipart_t::back() const should return const message_t&");
 
 /// \todo split this up into separate test cases
 ///
@@ -45,7 +225,7 @@ TEST_CASE("multipart legacy test", "[multipart]")
     multipart.push(message_t("Hello", 5));
     assert(multipart.size() == 1);
 
-    ok = multipart.send(output);
+    ok = multipart.send(output, send_flags::none);
     assert(multipart.empty());
     assert(ok);
 
@@ -75,6 +255,21 @@ TEST_CASE("multipart legacy test", "[multipart]")
     assert(ok);
     assert(copy.equal(&multipart));
 
+    // Test equality operators
+    assert(copy == multipart);
+    assert(multipart == copy);
+
+    multipart.pop();
+
+    assert(copy != multipart);
+    assert(multipart != copy);
+
+    multipart_t emptyMessage1{};
+    multipart_t emptyMessage2{};
+
+    assert(emptyMessage1 == emptyMessage2);
+    assert(emptyMessage2 == emptyMessage1);
+
     multipart.clear();
     assert(multipart.empty());
 
@@ -91,11 +286,18 @@ TEST_CASE("multipart legacy test", "[multipart]")
     multipart.pushmem("Frame0", 6);
     assert(multipart.size() == 10);
 
-    const message_t &front_msg = multipart.front();
+    const message_t &front_msg_nonconst = multipart.front();
+    assert(&front_msg_nonconst == &multipart[0]);
+
+    const multipart_t &const_multipart = multipart;
+    const message_t &front_msg = const_multipart.front();
     assert(multipart.size() == 10);
     assert(std::string(front_msg.data<char>(), front_msg.size()) == "Frame0");
 
-    const message_t &back_msg = multipart.back();
+    const message_t &back_msg_nonconst = multipart.back();
+    assert(&back_msg_nonconst == &multipart[multipart.size() - 1]);
+
+    const message_t &back_msg = const_multipart.back();
     assert(multipart.size() == 10);
     assert(std::string(back_msg.data<char>(), back_msg.size()) == "Frame9");
 
